@@ -105,6 +105,8 @@ def main():
                         help="force the native MLX backend (auto-converts .pt to .npz)")
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--cam", type=int, default=0, help="camera device index")
+    parser.add_argument("--out", default="demo_recording.mp4",
+                        help="output video path (default: demo_recording.mp4)")
     args = parser.parse_args()
 
     print(f"Loading delta: {args.delta}")
@@ -124,6 +126,14 @@ def main():
     cap = cv2.VideoCapture(args.cam)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera {args.cam}")
+
+    fourcc = cv2.VideoWriter_fourcc(*"avc1")  # H.264; falls back gracefully on Linux
+    writer = cv2.VideoWriter(args.out, fourcc, 30.0, (IMG_SIZE, IMG_SIZE))
+    if not writer.isOpened():
+        # avc1 unavailable (e.g. some Linux builds) — fall back to mp4v
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(args.out, fourcc, 30.0, (IMG_SIZE, IMG_SIZE))
+    print(f"Recording to: {args.out}")
 
     attack_on = False
     fps = 0.0
@@ -165,6 +175,7 @@ def main():
         cv2.putText(ann, bar, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (255, 255, 255), 1, cv2.LINE_AA)
 
+        writer.write(ann)
         cv2.imshow("Daedalus demo", ann)
 
         key = cv2.waitKey(1) & 0xFF
@@ -174,8 +185,10 @@ def main():
             attack_on = not attack_on
             print(f"Attack {'ON' if attack_on else 'OFF'}")
 
+    writer.release()
     cap.release()
     cv2.destroyAllWindows()
+    print(f"Saved recording -> {args.out}")
 
 
 if __name__ == "__main__":
