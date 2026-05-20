@@ -480,6 +480,10 @@ class DaedalusPoster:
         """Mean squared push of all scores toward 1: scalar."""
         return torch.mean((scores - 1.0) ** 2)
 
+    def _top_score(self, scores):
+        """Mean of top-300 scores — sensitive metric that shows early progress."""
+        return scores.reshape(scores.shape[0], -1).topk(300, dim=1).values.mean().item()
+
     # ------------------------------------------------------------------
     # mSAM ascent — micro-batch: one gradient per EOT transform
     # ------------------------------------------------------------------
@@ -529,15 +533,19 @@ class DaedalusPoster:
         composites, _ = apply_patch_eot(
             patch, backgrounds, eot_num=self.eot_num, scale_range=self.scale_range
         )
-        adv_loss = self._adv_loss(self._scores(composites))
+        scores = self._scores(composites)
+        adv_loss = self._adv_loss(scores)
         loss = self.adv_loss_weight * adv_loss
         loss.backward()
+
+        grad_norm = patch_w.grad.norm().item() if patch_w.grad is not None else 0.0
+        top_score = self._top_score(scores.detach())
 
         patch_w.data.sub_(e_w)          # restore before Adam step
         optimizer.base_optimizer.step()
         optimizer.zero_grad()
 
-        return adv_loss.item(), loss.item()
+        return adv_loss.item(), loss.item(), grad_norm, top_score
 
     # ------------------------------------------------------------------
     # Training loop
@@ -584,19 +592,33 @@ class DaedalusPoster:
         )
 
         for epoch in range(1, epochs + 1):
-            epoch_adv, epoch_loss, n_steps = 0.0, 0.0, 0
+            epoch_adv, epoch_loss, epoch_grad, epoch_top, n_steps = 0.0, 0.0, 0.0, 0.0, 0
 
             pbar = tqdm(loader, desc=f"epoch {epoch:3d}/{epochs}", leave=True, ascii=True)
             for backgrounds in pbar:
                 backgrounds = backgrounds.to(self.device)
-                adv, total = self._step(patch_w, optimizer, backgrounds)
+                adv, total, grad_norm, top_score = self._step(patch_w, optimizer, backgrounds)
                 epoch_adv  += adv
                 epoch_loss += total
+                epoch_grad += grad_norm
+                epoch_top  += top_score
                 n_steps    += 1
-                pbar.set_postfix(loss=f"{total:.4f}", adv=f"{adv:.4f}")
+                pbar.set_postfix(
+                    loss=f"{total:.4f}",
+                    adv=f"{adv:.4f}",
+                    top300=f"{top_score:.4f}",
+                    grad=f"{grad_norm:.2e}",
+                )
 
             epoch_adv  /= n_steps
             epoch_loss /= n_steps
+            epoch_grad /= n_steps
+            epoch_top  /= n_steps
+            print(
+                f"  -> epoch {epoch:3d} summary | "
+                f"loss={epoch_loss:.4f} adv={epoch_adv:.4f} "
+                f"top300={epoch_top:.4f} grad={epoch_grad:.2e}"
+            )
 
             if epoch % checkpoint_every == 0:
                 self._save(patch_w, save_path, tag=f"epoch{epoch:03d}")
