@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 import kornia.augmentation as KA
 from tqdm import tqdm
 from skimage import io
@@ -323,6 +324,48 @@ class Daedalus:
 
 
 # ---------------------------------------------------------------------------
+# Patch decoder
+# ---------------------------------------------------------------------------
+
+class PatchDecoder(nn.Module):
+    """
+    Residual-stream decoder: [1, C, 2, 2] → [1, 3, patch_size, patch_size].
+
+    Adapted from the Adversarial Plate trainer.  Six stages each double the
+    spatial size (2→4→8→16→32→64→128), then a final interpolate to the exact
+    patch size.  All stages share the same channel width C, forming a flat
+    residual stream so every layer has a short gradient path to the loss.
+
+    Each stage:
+      x = interpolate(x, 2x nearest) + leaky_relu(deconv(x))   # upsample
+      x = x + leaky_relu(conv7x7(x))                            # refine
+
+    A 1×1 conv projects to 3 channels; tanh + rescale gives [0, 1] output.
+    """
+
+    def __init__(self, patch_size: int = 100, channels: int = 64):
+        super().__init__()
+        self.patch_size = patch_size
+        C = channels
+        self.deconvs = nn.ModuleList([
+            nn.ConvTranspose2d(C, C, 4, stride=2, padding=1) for _ in range(6)
+        ])
+        self.convs = nn.ModuleList([
+            nn.Conv2d(C, C, 7, padding=3) for _ in range(6)
+        ])
+        self.final = nn.Conv2d(C, 3, 1)
+
+    def forward(self, seed: torch.Tensor) -> torch.Tensor:
+        x = seed
+        for deconv, conv in zip(self.deconvs, self.convs):
+            x = F.interpolate(x, scale_factor=2, mode='nearest') + F.leaky_relu(deconv(x), 0.2)
+            x = x + F.leaky_relu(conv(x), 0.2)
+        x = torch.tanh(self.final(x)) * 0.5 + 0.5  # [0, 1]
+        return F.interpolate(x, size=(self.patch_size, self.patch_size),
+                             mode='bilinear', align_corners=False)
+
+
+# ---------------------------------------------------------------------------
 # EOT compositing via kornia
 # ---------------------------------------------------------------------------
 
@@ -428,6 +471,7 @@ class SceneDataset(torch.utils.data.Dataset):
 PATCH_SIZE        = 100    # poster patch size in pixels (before EOT scaling)
 EOT_NUM           = 10     # random transforms per batch step
 ADV_LOSS_WEIGHT   = 1.0
+TV_WEIGHT         = 10.0
 EPOCHS            = 10
 BATCH_SIZE        = 8
 POSTER_SAVE_PATH  = "adv_examples/yolo26_poster/"
@@ -453,6 +497,7 @@ class DaedalusPoster:
         patch_size=PATCH_SIZE,
         eot_num=EOT_NUM,
         adv_loss_weight=ADV_LOSS_WEIGHT,
+        tv_weight=TV_WEIGHT,
         learning_rate=LEARNING_RATE,
         rho=SAM_RHO,
         scale_range=(0.15, 0.25),
@@ -461,6 +506,7 @@ class DaedalusPoster:
         self.patch_size = patch_size
         self.eot_num = eot_num
         self.adv_loss_weight = adv_loss_weight
+        self.tv_weight = tv_weight
         self.lr = learning_rate
         self.rho = rho
         self.scale_range = scale_range
@@ -475,6 +521,16 @@ class DaedalusPoster:
         self.model.model[-1].train()
         for p in self.model.parameters():
             p.requires_grad_(False)
+
+        self.decoder = PatchDecoder(patch_size=patch_size).to(self.device)
+        # Small seed init → decoder output ≈ 0.5 (neutral grey)
+        self.seed = nn.Parameter(
+            torch.randn(1, 64, 2, 2, device=self.device) * 0.1
+        )
+
+    def _patch(self) -> torch.Tensor:
+        """Run decoder to produce the current patch: (1, 3, P, P) in [0, 1]."""
+        return self.decoder(self.seed)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -500,66 +556,81 @@ class DaedalusPoster:
         """Mean of top-300 scores — the same quantity optimised by _adv_loss."""
         return scores.reshape(scores.shape[0], -1).topk(300, dim=1).values.mean().item()
 
+    def _tv_loss(self, patch):
+        """Isotropic L2 total variation, normalised by number of pixel comparisons."""
+        if patch.dim() == 4:
+            patch = patch.squeeze(0)
+        C, H, W = patch.shape
+        tv_h = (patch[:, :, 1:] - patch[:, :, :-1]).pow(2).sum()
+        tv_v = (patch[:, 1:, :] - patch[:, :-1, :]).pow(2).sum()
+        return (tv_h + tv_v) / (C * (H * (W - 1) + (H - 1) * W))
+
     # ------------------------------------------------------------------
     # mSAM ascent — micro-batch: one gradient per EOT transform
     # ------------------------------------------------------------------
 
-    def _msam_ascent(self, patch_w, backgrounds):
+    def _params(self):
+        """All optimisable parameters: seed + decoder weights."""
+        return [self.seed] + list(self.decoder.parameters())
+
+    def _msam_ascent(self, backgrounds, optimizer):
         """
-        Perturb patch_w toward the mean of per-transform normalised gradients.
+        Perturb all params toward the mean of per-transform normalised gradients.
 
-        Each EOT transform is a separate 'micro-batch example': its gradient
-        is normalised independently before averaging, so rare-but-important
-        viewpoints are not drowned out by the majority.
-
-        Returns the ascent vector so the caller can restore patch_w before
-        the descent step.
+        Each EOT transform is a separate micro-batch example: its gradient is
+        normalised independently before averaging.
         """
         e_ws = []
         for _ in range(self.eot_num):
-            if patch_w.grad is not None:
-                patch_w.grad.zero_()
-
-            patch = torch.sigmoid(patch_w)
+            optimizer.zero_grad()
+            patch = self._patch()
             composites, _ = apply_patch_eot(
                 patch, backgrounds, eot_num=1, scale_range=self.scale_range
             )
-            loss = self.adv_loss_weight * self._adv_loss(self._scores(composites))
+            loss = (self.adv_loss_weight * self._adv_loss(self._scores(composites))
+                    + self.tv_weight * self._tv_loss(patch))
             loss.backward()
 
-            g = patch_w.grad.detach().clone()
-            e_ws.append(self.rho / (g.norm(2) + 1e-12) * g)
+            grads = [p.grad.detach().clone() for p in self._params() if p.grad is not None]
+            flat = torch.cat([g.flatten() for g in grads])
+            norm = flat.norm(2) + 1e-12
+            e_ws.append([(self.rho / norm) * g for g in grads])
 
-        e_w = torch.stack(e_ws).mean(0)
-        patch_w.data.add_(e_w)
-        return e_w
+        # Average per-transform perturbations and apply
+        mean_e_w = [torch.stack([e[i] for e in e_ws]).mean(0) for i in range(len(e_ws[0]))]
+        for p, e in zip(self._params(), mean_e_w):
+            p.data.add_(e)
+        return mean_e_w
 
     # ------------------------------------------------------------------
     # Single training step
     # ------------------------------------------------------------------
 
-    def _step(self, patch_w, optimizer, backgrounds):
+    def _step(self, optimizer, backgrounds):
         # Ascent
-        optimizer.zero_grad()
-        e_w = self._msam_ascent(patch_w, backgrounds)
+        e_w = self._msam_ascent(backgrounds, optimizer)
 
         # Descent at perturbed point
         optimizer.zero_grad()
-        patch = torch.sigmoid(patch_w)
+        patch = self._patch()
         composites, _ = apply_patch_eot(
             patch, backgrounds, eot_num=self.eot_num, scale_range=self.scale_range
         )
         scores = self._scores(composites)
         adv_loss = self._adv_loss(scores)
-        loss = self.adv_loss_weight * adv_loss
+        tv_loss = self._tv_loss(patch)
+        loss = self.adv_loss_weight * adv_loss + self.tv_weight * tv_loss
         loss.backward()
 
-        grad_norm = patch_w.grad.norm().item() if patch_w.grad is not None else 0.0
-        top_score = self._top_score(scores.detach())
-
-        patch_w.data.sub_(e_w)          # restore before Adam step
+        # Restore params before optimizer step
+        for p, e in zip(self._params(), e_w):
+            p.data.sub_(e)
         optimizer.base_optimizer.step()
         optimizer.zero_grad()
+
+        grad_norm = sum(p.grad.norm().item() ** 2 for p in self._params()
+                        if p.grad is not None) ** 0.5
+        top_score = self._top_score(scores.detach())
 
         return adv_loss.item(), grad_norm, top_score
 
@@ -594,12 +665,7 @@ class DaedalusPoster:
             num_workers=2, pin_memory=(self.device == "cuda"), drop_last=True,
         )
 
-        # Patch in sigmoid-space: sigmoid(0) = 0.5, a neutral grey start
-        patch_w = torch.zeros(
-            1, 3, self.patch_size, self.patch_size,
-            device=self.device, requires_grad=True,
-        )
-        optimizer = mSAM([patch_w], torch.optim.AdamW, rho=self.rho, lr=self.lr)
+        optimizer = mSAM(self._params(), torch.optim.AdamW, rho=self.rho, lr=self.lr)
         total_steps = epochs * len(loader)
         warmup_steps = max(1, int(total_steps * 0.1))
         scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -629,7 +695,7 @@ class DaedalusPoster:
             pbar = tqdm(loader, desc=f"epoch {epoch:3d}/{epochs}", leave=True, ascii=True)
             for backgrounds in pbar:
                 backgrounds = backgrounds.to(self.device)
-                adv, grad_norm, top_score = self._step(patch_w, optimizer, backgrounds)
+                adv, grad_norm, top_score = self._step(optimizer, backgrounds)
                 scheduler.step()
                 epoch_adv  += adv
                 epoch_grad += grad_norm
@@ -651,18 +717,18 @@ class DaedalusPoster:
             )
 
             if epoch % checkpoint_every == 0:
-                self._save(patch_w, save_path, tag=f"epoch{epoch:03d}")
+                self._save(save_path, tag=f"epoch{epoch:03d}")
 
-        patch = self._save(patch_w, save_path, tag="final")
+        patch = self._save(save_path, tag="final")
         return patch
 
     # ------------------------------------------------------------------
     # Save helpers
     # ------------------------------------------------------------------
 
-    def _save(self, patch_w, save_path, tag=""):
+    def _save(self, save_path, tag=""):
         patch_np = (
-            torch.sigmoid(patch_w).squeeze(0).permute(1, 2, 0)
+            self._patch().squeeze(0).permute(1, 2, 0)
             .detach().cpu().numpy()
         )
         fname = f"patch_{tag}.png" if tag else "patch.png"
