@@ -16,6 +16,9 @@ Usage:
 
     # Universal mode: build the adversarial image from a clean image + saved delta:
     python visualize_attack.py CLEAN_IMAGE --delta adv_examples/yolo26_universal/delta_final.npy
+
+    # Test transfer to a bigger model than the one attacked:
+    python visualize_attack.py CLEAN_IMAGE --delta delta_final.npy --model yolo26x.pt
 """
 
 import argparse
@@ -65,6 +68,10 @@ def main():
                         help="path to the adversarial image (omit when using --delta)")
     parser.add_argument("--delta", default=None,
                         help="universal delta .npy; builds adv = clip(clean + delta, 0, 1)")
+    parser.add_argument("--model", default=MODEL_PATH,
+                        help="YOLO weights to evaluate against, e.g. yolo26n.pt, "
+                             "yolo26s.pt, yolo26m.pt, yolo26l.pt, yolo26x.pt "
+                             "(test transfer to bigger models than the one attacked)")
     parser.add_argument("--out", default="comparison.png")
     parser.add_argument("--conf", type=float, default=0.25,
                         help="confidence threshold for displayed detections")
@@ -76,7 +83,7 @@ def main():
     elif args.adv is None:
         parser.error("provide an ADV image path or --delta")
 
-    model = YOLO(MODEL_PATH)
+    model = YOLO(args.model)
 
     rc = model.predict(args.clean, imgsz=IMG_SIZE, conf=args.conf, verbose=False)[0]
     ra = model.predict(args.adv,   imgsz=IMG_SIZE, conf=args.conf, verbose=False)[0]
@@ -99,6 +106,7 @@ def main():
     grid = cv2.vconcat([top, bot])
     cv2.imwrite(args.out, grid)
 
+    print(f"model                  : {args.model}")
     print(f"clean detections       : {n_clean}")
     print(f"adversarial detections : {n_adv}")
     print(f"comparison grid saved  -> {args.out}")
