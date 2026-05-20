@@ -115,12 +115,12 @@ class mSAM:
 
 # Defaults
 CONFIDENCE       = 0.3
-LEARNING_RATE    = 1e-2
+LEARNING_RATE    = 1e-3
 BINARY_SEARCH_STEPS = 5
 MAX_ITERATIONS   = 10000
 ABORT_EARLY      = True
 INITIAL_CONST    = 2.0
-SAM_RHO          = 0.05
+SAM_RHO          = 0.025
 IMAGE_SIZE       = 640
 MODEL_PATH       = "yolo26n.pt"
 SAVE_PATH        = "adv_examples/yolo26/"
@@ -592,6 +592,10 @@ class DaedalusPoster:
             device=self.device, requires_grad=True,
         )
         optimizer = mSAM([patch_w], torch.optim.Adam, rho=self.rho, lr=self.lr)
+        total_steps = epochs * len(loader)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer.base_optimizer, T_max=total_steps, eta_min=self.lr * 0.01,
+        )
 
         print(
             f"\n=== Training universal poster patch ({self.patch_size}×{self.patch_size}) ===\n"
@@ -606,6 +610,7 @@ class DaedalusPoster:
             for backgrounds in pbar:
                 backgrounds = backgrounds.to(self.device)
                 adv, total, grad_norm, top_score = self._step(patch_w, optimizer, backgrounds)
+                scheduler.step()
                 epoch_adv  += adv
                 epoch_loss += total
                 epoch_grad += grad_norm
@@ -616,6 +621,7 @@ class DaedalusPoster:
                     adv=f"{adv:.4f}",
                     top300=f"{top_score:.4f}",
                     grad=f"{grad_norm:.2e}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 )
 
             epoch_adv  /= n_steps
