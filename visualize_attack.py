@@ -19,16 +19,32 @@ Usage:
 
     # Test transfer to a bigger model than the one attacked:
     python visualize_attack.py CLEAN_IMAGE --delta delta_final.npy --model yolo26x.pt
+
+    # Evaluate against a native MLX (Apple Silicon) model — pass an .npz weight:
+    python visualize_attack.py CLEAN_IMAGE --delta delta_final.npy --model yolo26n.npz
 """
 
 import argparse
 import os
 import cv2
 import numpy as np
-from ultralytics import YOLO
 
 MODEL_PATH = "yolo26n.pt"
 IMG_SIZE = 640
+
+
+def _load_model(path):
+    """
+    Load YOLO weights, picking the backend by file extension: an .npz weight
+    uses the native MLX implementation (yolo-mlx), anything else uses
+    ultralytics.  Returns (model, is_mlx).  is_mlx matters because the two
+    backends' plot() differ in channel order (see main()).
+    """
+    if path.lower().endswith(".npz"):
+        from yolo26mlx import YOLO
+        return YOLO(path), True
+    from ultralytics import YOLO
+    return YOLO(path), False
 
 
 def _build_adv_from_delta(clean_path, delta_path, out_dir="."):
@@ -71,7 +87,8 @@ def main():
     parser.add_argument("--model", default=MODEL_PATH,
                         help="YOLO weights to evaluate against, e.g. yolo26n.pt, "
                              "yolo26s.pt, yolo26m.pt, yolo26l.pt, yolo26x.pt "
-                             "(test transfer to bigger models than the one attacked)")
+                             "(test transfer to bigger models than the one attacked). "
+                             "An .npz weight uses the native MLX backend (yolo-mlx).")
     parser.add_argument("--out", default="comparison.png")
     parser.add_argument("--conf", type=float, default=0.25,
                         help="confidence threshold for displayed detections")
@@ -83,7 +100,7 @@ def main():
     elif args.adv is None:
         parser.error("provide an ADV image path or --delta")
 
-    model = YOLO(args.model)
+    model, is_mlx = _load_model(args.model)
 
     rc = model.predict(args.clean, imgsz=IMG_SIZE, conf=args.conf, verbose=False)[0]
     ra = model.predict(args.adv,   imgsz=IMG_SIZE, conf=args.conf, verbose=False)[0]
@@ -95,9 +112,14 @@ def main():
     clean_raw = cv2.resize(cv2.imread(args.clean), (IMG_SIZE, IMG_SIZE))
     adv_raw   = cv2.resize(cv2.imread(args.adv),   (IMG_SIZE, IMG_SIZE))
 
-    # Annotated images from ultralytics (BGR)
-    clean_ann = cv2.resize(rc.plot(), (IMG_SIZE, IMG_SIZE))
-    adv_ann   = cv2.resize(ra.plot(), (IMG_SIZE, IMG_SIZE))
+    # Annotated images: ultralytics plot() is BGR, yolo-mlx plot() is RGB.
+    clean_ann = rc.plot()
+    adv_ann = ra.plot()
+    if is_mlx:
+        clean_ann = cv2.cvtColor(clean_ann, cv2.COLOR_RGB2BGR)
+        adv_ann = cv2.cvtColor(adv_ann, cv2.COLOR_RGB2BGR)
+    clean_ann = cv2.resize(clean_ann, (IMG_SIZE, IMG_SIZE))
+    adv_ann   = cv2.resize(adv_ann,   (IMG_SIZE, IMG_SIZE))
 
     top = cv2.hconcat([_label(clean_raw, "clean"),
                        _label(adv_raw,   "adversarial")])
