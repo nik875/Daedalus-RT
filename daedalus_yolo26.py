@@ -122,6 +122,8 @@ ITERATIONS       = 1000
 # visible distortion (the paper's CW binary search effectively did this by
 # driving its trade-off constant c very large).
 ADV_WEIGHT       = 1.0
+SUPPRESS_WEIGHT  = 1.0     # weight on suppressing the clean image's real detections
+LEGIT_THRESH     = 0.25    # confidence above which a clean detection counts as "real"
 L2_WEIGHT        = 0.05
 SAM_RHO          = 0.025
 IMAGE_SIZE       = 640
@@ -133,13 +135,17 @@ class Daedalus:
     """
     Single-image Daedalus attack targeting YOLO26's one2one head.
 
-    Optimises a full-image perturbation for one specific image so the top-300
-    one2one slots are driven toward confidence 1.0, filling YOLO26's detection
-    output with high-confidence spurious boxes.
+    Optimises a full-image perturbation for one specific image with two goals:
+      1. Flood: drive the top-300 one2one slots toward confidence 1.0, filling
+         YOLO26's output with high-confidence spurious boxes.
+      2. Suppress: drive the confidence of the clean image's *real* detections
+         toward 0, so the legitimate objects vanish from the output.
 
-    Loss        : adv_weight * top300_loss + L2 distortion
-    Optimizer   : mSAM (SAM) wrapping AdamW
-    Schedule    : linear warmup (first 10%) then cosine decay
+    Loss      : adv_weight * top300_loss
+                + suppress_weight * legit_suppression_loss
+                + l2_weight * L2 distortion
+    Optimizer : mSAM (SAM) wrapping AdamW
+    Schedule  : linear warmup (first 10%) then cosine decay
     """
 
     def __init__(
@@ -148,6 +154,8 @@ class Daedalus:
         learning_rate=LEARNING_RATE,
         iterations=ITERATIONS,
         adv_weight=ADV_WEIGHT,
+        suppress_weight=SUPPRESS_WEIGHT,
+        legit_thresh=LEGIT_THRESH,
         l2_weight=L2_WEIGHT,
         rho=SAM_RHO,
         device=None,
@@ -155,6 +163,8 @@ class Daedalus:
         self.lr = learning_rate
         self.iterations = iterations
         self.adv_weight = adv_weight
+        self.suppress_weight = suppress_weight
+        self.legit_thresh = legit_thresh
         self.l2_weight = l2_weight
         self.rho = rho
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -187,6 +197,14 @@ class Daedalus:
         """Mean of the top-300 scores — the quantity optimised by _adv_loss."""
         return scores.reshape(scores.shape[0], -1).topk(300, dim=1).values.mean().item()
 
+    def _suppress_loss(self, scores, legit_mask, n_legit):
+        """
+        Push the (slot, class) entries that were confident on the CLEAN image
+        toward 0, so the real detections disappear.  legit_mask is a {0,1}
+        tensor marking those entries; n_legit is its count (>=1).
+        """
+        return (scores ** 2 * legit_mask).sum() / n_legit
+
     def _l2_dist(self, newimgs, orig):
         """Per-pixel mean squared distortion (order ~1, comparable to adv_loss)."""
         return torch.mean((newimgs - orig) ** 2)
@@ -217,6 +235,14 @@ class Daedalus:
         # arctanh-space representation of the original image
         w_orig = torch.arctanh((orig * 2.0 - 1.0).clamp(-0.999999, 0.999999))
 
+        # Identify the clean image's legitimate detections: (slot, class) entries
+        # that are already confident.  These are what the suppression term kills.
+        with torch.no_grad():
+            clean_scores = self._scores(orig)
+        legit_mask = (clean_scores > self.legit_thresh).float()
+        n_legit = legit_mask.sum().clamp(min=1.0)
+        print(f"  legitimate detections to suppress: {int(legit_mask.sum().item())}")
+
         delta = torch.zeros_like(w_orig, requires_grad=True)
         optimizer = mSAM([delta], torch.optim.AdamW, rho=self.rho, lr=self.lr)
         warmup_steps = max(1, int(self.iterations * 0.1))
@@ -240,7 +266,9 @@ class Daedalus:
             # --- SAM ascent: first forward pass ---
             optimizer.zero_grad()
             newimgs = self._to_img(w_orig, delta)
-            loss = self.adv_weight * self._adv_loss(self._scores(newimgs)) \
+            scores = self._scores(newimgs)
+            loss = self.adv_weight * self._adv_loss(scores) \
+                + self.suppress_weight * self._suppress_loss(scores, legit_mask, n_legit) \
                 + self.l2_weight * self._l2_dist(newimgs, orig)
             loss.backward()
             optimizer.ascent_step()
@@ -250,8 +278,11 @@ class Daedalus:
             newimgs = self._to_img(w_orig, delta)
             scores = self._scores(newimgs)
             adv_loss = self._adv_loss(scores)
+            supp_loss = self._suppress_loss(scores, legit_mask, n_legit)
             l2 = self._l2_dist(newimgs, orig)
-            loss = self.adv_weight * adv_loss + self.l2_weight * l2
+            loss = self.adv_weight * adv_loss \
+                + self.suppress_weight * supp_loss \
+                + self.l2_weight * l2
             loss.backward()
 
             grad_norm = delta.grad.norm().item() if delta.grad is not None else 0.0
@@ -261,6 +292,7 @@ class Daedalus:
 
             pbar.set_postfix(
                 adv=f"{adv_loss.item():.4f}",
+                supp=f"{supp_loss.item():.4f}",
                 top300=f"{top_score:.4f}",
                 l2=f"{l2.item():.2e}",
                 grad=f"{grad_norm:.2e}",
