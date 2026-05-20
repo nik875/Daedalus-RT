@@ -427,7 +427,7 @@ class SceneDataset(torch.utils.data.Dataset):
 
 PATCH_SIZE        = 100    # poster patch size in pixels (before EOT scaling)
 EOT_NUM           = 10     # random transforms per batch step
-ADV_LOSS_WEIGHT   = 2.0    # fixed trade-off weight (replaces CW binary search)
+ADV_LOSS_WEIGHT   = 1.0
 EPOCHS            = 10
 BATCH_SIZE        = 8
 POSTER_SAVE_PATH  = "adv_examples/yolo26_poster/"
@@ -561,7 +561,7 @@ class DaedalusPoster:
         optimizer.base_optimizer.step()
         optimizer.zero_grad()
 
-        return adv_loss.item(), loss.item(), grad_norm, top_score
+        return adv_loss.item(), grad_norm, top_score
 
     # ------------------------------------------------------------------
     # Training loop
@@ -612,20 +612,18 @@ class DaedalusPoster:
         )
 
         for epoch in range(1, epochs + 1):
-            epoch_adv, epoch_loss, epoch_grad, epoch_top, n_steps = 0.0, 0.0, 0.0, 0.0, 0
+            epoch_adv, epoch_grad, epoch_top, n_steps = 0.0, 0.0, 0.0, 0
 
             pbar = tqdm(loader, desc=f"epoch {epoch:3d}/{epochs}", leave=True, ascii=True)
             for backgrounds in pbar:
                 backgrounds = backgrounds.to(self.device)
-                adv, total, grad_norm, top_score = self._step(patch_w, optimizer, backgrounds)
+                adv, grad_norm, top_score = self._step(patch_w, optimizer, backgrounds)
                 scheduler.step()
                 epoch_adv  += adv
-                epoch_loss += total
                 epoch_grad += grad_norm
                 epoch_top  += top_score
                 n_steps    += 1
                 pbar.set_postfix(
-                    loss=f"{total:.4f}",
                     adv=f"{adv:.4f}",
                     top300=f"{top_score:.4f}",
                     grad=f"{grad_norm:.2e}",
@@ -633,13 +631,11 @@ class DaedalusPoster:
                 )
 
             epoch_adv  /= n_steps
-            epoch_loss /= n_steps
             epoch_grad /= n_steps
             epoch_top  /= n_steps
             print(
                 f"  -> epoch {epoch:3d} summary | "
-                f"loss={epoch_loss:.4f} adv={epoch_adv:.4f} "
-                f"top300={epoch_top:.4f} grad={epoch_grad:.2e}"
+                f"adv={epoch_adv:.4f} top300={epoch_top:.4f} grad={epoch_grad:.2e}"
             )
 
             if epoch % checkpoint_every == 0:
