@@ -116,7 +116,13 @@ class mSAM:
 # Defaults
 LEARNING_RATE    = 3e-3
 ITERATIONS       = 1000
-ADV_WEIGHT       = 1.0     # trade-off: adv_weight * adv_loss + L2 distortion
+# loss = adv_weight * adv_loss + l2_weight * mean_per_pixel_L2.
+# Both terms are normalised to order ~1, so the weights are directly comparable.
+# l2_weight << adv_weight prioritises the attack while lightly penalising
+# visible distortion (the paper's CW binary search effectively did this by
+# driving its trade-off constant c very large).
+ADV_WEIGHT       = 1.0
+L2_WEIGHT        = 0.05
 SAM_RHO          = 0.025
 IMAGE_SIZE       = 640
 MODEL_PATH       = "yolo26n.pt"
@@ -142,12 +148,14 @@ class Daedalus:
         learning_rate=LEARNING_RATE,
         iterations=ITERATIONS,
         adv_weight=ADV_WEIGHT,
+        l2_weight=L2_WEIGHT,
         rho=SAM_RHO,
         device=None,
     ):
         self.lr = learning_rate
         self.iterations = iterations
         self.adv_weight = adv_weight
+        self.l2_weight = l2_weight
         self.rho = rho
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -180,8 +188,8 @@ class Daedalus:
         return scores.reshape(scores.shape[0], -1).topk(300, dim=1).values.mean().item()
 
     def _l2_dist(self, newimgs, orig):
-        """L2 distortion between adversarial and original image: scalar."""
-        return torch.sum((newimgs - orig) ** 2)
+        """Per-pixel mean squared distortion (order ~1, comparable to adv_loss)."""
+        return torch.mean((newimgs - orig) ** 2)
 
     def _to_img(self, w_orig, delta):
         """tanh reparameterisation keeps pixels in [0, 1]."""
@@ -233,7 +241,7 @@ class Daedalus:
             optimizer.zero_grad()
             newimgs = self._to_img(w_orig, delta)
             loss = self.adv_weight * self._adv_loss(self._scores(newimgs)) \
-                + self._l2_dist(newimgs, orig)
+                + self.l2_weight * self._l2_dist(newimgs, orig)
             loss.backward()
             optimizer.ascent_step()
 
@@ -243,7 +251,7 @@ class Daedalus:
             scores = self._scores(newimgs)
             adv_loss = self._adv_loss(scores)
             l2 = self._l2_dist(newimgs, orig)
-            loss = self.adv_weight * adv_loss + l2
+            loss = self.adv_weight * adv_loss + self.l2_weight * l2
             loss.backward()
 
             grad_norm = delta.grad.norm().item() if delta.grad is not None else 0.0
@@ -254,7 +262,7 @@ class Daedalus:
             pbar.set_postfix(
                 adv=f"{adv_loss.item():.4f}",
                 top300=f"{top_score:.4f}",
-                l2=f"{l2.item():.2f}",
+                l2=f"{l2.item():.2e}",
                 grad=f"{grad_norm:.2e}",
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
             )
