@@ -597,7 +597,7 @@ class DaedalusPoster:
         for epoch in range(1, epochs + 1):
             epoch_adv, epoch_loss, n_steps = 0.0, 0.0, 0
 
-            pbar = tqdm(loader, desc=f"epoch {epoch:3d}/{epochs}", leave=True)
+            pbar = tqdm(loader, desc=f"epoch {epoch:3d}/{epochs}", leave=True, ascii=True)
             for backgrounds in pbar:
                 backgrounds = backgrounds.to(self.device)
                 adv, total = self._step(patch_w, optimizer, backgrounds)
