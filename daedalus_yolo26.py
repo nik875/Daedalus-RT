@@ -577,11 +577,22 @@ class DaedalusGenerator(Daedalus):
             f"  |  batch : {batch_size}  |  epochs : {epochs}\n"
         )
 
-        optimizer = mSAM(
-            self.generator.parameters(), torch.optim.AdamW,
-            rho=self.rho, lr=self.lr,
-        )
-        total_steps  = epochs * len(loader)
+        # Warm-start curriculum.  The applied perturbation is a per-step blend
+        #     delta = (1 - alpha) * u  +  alpha * G(x)
+        # of a learnable raw UAP tensor `u` (high-frequency capacity, learns
+        # fast) and the U-Net output G(x).  alpha=0 for all of epoch 1 (learn a
+        # good UAP only), then ramps linearly 0 -> 1 over the remaining epochs,
+        # so by the end the perturbation is pure G(x).  This hands the U-Net a
+        # working solution to imitate instead of bootstrapping from zero.
+        u = torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE,
+                        device=self.device, requires_grad=True)
+        params = [u] + list(self.generator.parameters())
+        optimizer = mSAM(params, torch.optim.AdamW, rho=self.rho, lr=self.lr)
+
+        steps_per_epoch = len(loader)
+        total_steps  = epochs * steps_per_epoch
+        ramp_start   = steps_per_epoch                 # alpha leaves 0 after epoch 1
+        ramp_steps   = max(1, total_steps - ramp_start)
         warmup_steps = max(1, int(total_steps * 0.1))
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer.base_optimizer,
@@ -598,6 +609,13 @@ class DaedalusGenerator(Daedalus):
             milestones=[warmup_steps],
         )
 
+        def adv_image(imgs, alpha):
+            """Blended-perturbation adversarial batch: (1-a)*u + a*G(x)."""
+            cond = self.fixed_z if self.fixed_input else imgs
+            delta = (1.0 - alpha) * u + alpha * self.generator(cond)
+            return (imgs + delta).clamp(0.0, 1.0)
+
+        global_step = 0
         for epoch in range(1, epochs + 1):
             ep_adv = ep_top = 0.0
             n_steps = 0
@@ -605,37 +623,49 @@ class DaedalusGenerator(Daedalus):
             for imgs in pbar:
                 imgs = imgs.to(self.device)
 
+                # Per-step alpha: 0 through epoch 1, then linear 0 -> 1.
+                alpha = 0.0 if global_step < ramp_start else \
+                    min(1.0, (global_step - ramp_start) / (ramp_steps - 1))
+
                 # mSAM ascent — first forward pass
                 optimizer.zero_grad()
-                loss = self.adv_weight * self._adv_loss(self._scores(self._apply(imgs)))
+                loss = self.adv_weight * self._adv_loss(self._scores(adv_image(imgs, alpha)))
                 loss.backward()
                 optimizer.ascent_step()
 
-                # mSAM descent — second forward pass at perturbed generator params
+                # mSAM descent — second forward pass at perturbed params
                 optimizer.zero_grad()
-                scores = self._scores(self._apply(imgs))
+                scores = self._scores(adv_image(imgs, alpha))
                 adv    = self._adv_loss(scores)
                 (self.adv_weight * adv).backward()
 
-                grad_norm = sum(
+                g_grad = sum(
                     p.grad.norm().item() ** 2
                     for p in self.generator.parameters() if p.grad is not None
                 ) ** 0.5
+                u_grad = u.grad.norm().item() if u.grad is not None else 0.0
                 top = self._top_score(scores.detach())
                 optimizer.descent_step()
                 scheduler.step()
 
+                # Keep the raw UAP inside the L-inf ball (G is bounded by tanh*eps,
+                # so the convex blend stays within +/- epsilon).
+                with torch.no_grad():
+                    u.clamp_(-self.epsilon, self.epsilon)
+
+                global_step += 1
                 ep_adv += adv.item(); ep_top += top
                 n_steps += 1
                 pbar.set_postfix(
+                    alpha=f"{alpha:.3f}",
                     adv=f"{adv.item():.4f}",
                     top300=f"{top:.4f}",
-                    grad=f"{grad_norm:.2e}",
-                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                    g_grad=f"{g_grad:.2e}",
+                    u_grad=f"{u_grad:.2e}",
                 )
 
-            print(f"  -> epoch {epoch:3d} | adv={ep_adv / n_steps:.4f} "
-                  f"top300={ep_top / n_steps:.4f}")
+            print(f"  -> epoch {epoch:3d} | alpha={alpha:.3f} "
+                  f"adv={ep_adv / n_steps:.4f} top300={ep_top / n_steps:.4f}")
             if epoch % checkpoint_every == 0:
                 self._save_generator(save_path, tag=f"epoch{epoch:03d}", imgs=imgs)
 
