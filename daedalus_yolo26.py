@@ -121,28 +121,28 @@ ITERATIONS       = 1000
 # visible distortion (the paper's CW binary search effectively did this by
 # driving its trade-off constant c very large).
 ADV_WEIGHT       = 1.0
-SUPPRESS_WEIGHT  = 1.0     # weight on suppressing the clean image's real detections
-LEGIT_THRESH     = 0.25    # confidence above which a clean detection counts as "real"
 L2_WEIGHT        = 0.05
 SAM_RHO          = 0.025
 IMAGE_SIZE       = 640
 MODEL_PATH       = "yolo26n.pt"
 SAVE_PATH        = "adv_examples/yolo26/"
 
+# Universal-perturbation defaults
+EPOCHS           = 10
+BATCH_SIZE       = 8
+EPSILON          = 16 / 255   # L-inf budget on the universal perturbation
+UNIVERSAL_SAVE_PATH = "adv_examples/yolo26_universal/"
+
 
 class Daedalus:
     """
     Single-image Daedalus attack targeting YOLO26's one2one head.
 
-    Optimises a full-image perturbation for one specific image with two goals:
-      1. Flood: drive every one2one slot's confidence toward 1.0 (paper's
-         loss), filling YOLO26's output with high-confidence spurious boxes.
-      2. Suppress: drive the confidence of the clean image's *real* detections
-         toward 0, so the legitimate objects vanish from the output.
+    Optimises a full-image perturbation for one specific image that drives
+    every one2one slot's confidence toward 1.0 (the paper's loss), filling
+    YOLO26's output with high-confidence spurious boxes.
 
-    Loss      : adv_weight * confidence_loss
-                + suppress_weight * legit_suppression_loss
-                + l2_weight * L2 distortion
+    Loss      : adv_weight * confidence_loss + l2_weight * L2 distortion
     Optimizer : mSAM (SAM) wrapping AdamW
     Schedule  : linear warmup (first 10%) then cosine decay
     """
@@ -153,8 +153,6 @@ class Daedalus:
         learning_rate=LEARNING_RATE,
         iterations=ITERATIONS,
         adv_weight=ADV_WEIGHT,
-        suppress_weight=SUPPRESS_WEIGHT,
-        legit_thresh=LEGIT_THRESH,
         l2_weight=L2_WEIGHT,
         rho=SAM_RHO,
         device=None,
@@ -162,8 +160,6 @@ class Daedalus:
         self.lr = learning_rate
         self.iterations = iterations
         self.adv_weight = adv_weight
-        self.suppress_weight = suppress_weight
-        self.legit_thresh = legit_thresh
         self.l2_weight = l2_weight
         self.rho = rho
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -195,16 +191,8 @@ class Daedalus:
         return torch.mean((scores - 1.0) ** 2)
 
     def _top_score(self, scores):
-        """Mean of the top-300 scores — the quantity optimised by _adv_loss."""
+        """Mean of the top-300 scores — display-only progress metric."""
         return scores.reshape(scores.shape[0], -1).topk(300, dim=1).values.mean().item()
-
-    def _suppress_loss(self, scores, legit_mask, n_legit):
-        """
-        Push the (slot, class) entries that were confident on the CLEAN image
-        toward 0, so the real detections disappear.  legit_mask is a {0,1}
-        tensor marking those entries; n_legit is its count (>=1).
-        """
-        return (scores ** 2 * legit_mask).sum() / n_legit
 
     def _l2_dist(self, newimgs, orig):
         """Per-pixel mean squared distortion (order ~1, comparable to adv_loss)."""
@@ -236,14 +224,6 @@ class Daedalus:
         # arctanh-space representation of the original image
         w_orig = torch.arctanh((orig * 2.0 - 1.0).clamp(-0.999999, 0.999999))
 
-        # Identify the clean image's legitimate detections: (slot, class) entries
-        # that are already confident.  These are what the suppression term kills.
-        with torch.no_grad():
-            clean_scores = self._scores(orig)
-        legit_mask = (clean_scores > self.legit_thresh).float()
-        n_legit = legit_mask.sum().clamp(min=1.0)
-        print(f"  legitimate detections to suppress: {int(legit_mask.sum().item())}")
-
         delta = torch.zeros_like(w_orig, requires_grad=True)
         optimizer = mSAM([delta], torch.optim.AdamW, rho=self.rho, lr=self.lr)
         warmup_steps = max(1, int(self.iterations * 0.1))
@@ -267,9 +247,7 @@ class Daedalus:
             # --- SAM ascent: first forward pass ---
             optimizer.zero_grad()
             newimgs = self._to_img(w_orig, delta)
-            scores = self._scores(newimgs)
-            loss = self.adv_weight * self._adv_loss(scores) \
-                + self.suppress_weight * self._suppress_loss(scores, legit_mask, n_legit) \
+            loss = self.adv_weight * self._adv_loss(self._scores(newimgs)) \
                 + self.l2_weight * self._l2_dist(newimgs, orig)
             loss.backward()
             optimizer.ascent_step()
@@ -279,11 +257,8 @@ class Daedalus:
             newimgs = self._to_img(w_orig, delta)
             scores = self._scores(newimgs)
             adv_loss = self._adv_loss(scores)
-            supp_loss = self._suppress_loss(scores, legit_mask, n_legit)
             l2 = self._l2_dist(newimgs, orig)
-            loss = self.adv_weight * adv_loss \
-                + self.suppress_weight * supp_loss \
-                + self.l2_weight * l2
+            loss = self.adv_weight * adv_loss + self.l2_weight * l2
             loss.backward()
 
             grad_norm = delta.grad.norm().item() if delta.grad is not None else 0.0
@@ -293,7 +268,6 @@ class Daedalus:
 
             pbar.set_postfix(
                 adv=f"{adv_loss.item():.4f}",
-                supp=f"{supp_loss.item():.4f}",
                 top300=f"{top_score:.4f}",
                 l2=f"{l2.item():.2e}",
                 grad=f"{grad_norm:.2e}",
@@ -337,6 +311,153 @@ class Daedalus:
 
 
 # ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class SceneDataset(torch.utils.data.Dataset):
+    """Loads all images from a directory, resized to a fixed size, RGB [0, 1]."""
+
+    EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    def __init__(self, image_dir, size=IMAGE_SIZE):
+        self.size = size
+        self.paths = sorted(
+            os.path.join(root, f)
+            for root, _, files in os.walk(image_dir)
+            for f in files
+            if os.path.splitext(f)[1].lower() in self.EXTS
+        )
+        if not self.paths:
+            raise FileNotFoundError(f"No images found in {image_dir}")
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        img = cv2.imread(self.paths[idx])
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (self.size, self.size), interpolation=cv2.INTER_CUBIC)
+        return torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
+
+
+# ---------------------------------------------------------------------------
+# Universal perturbation
+# ---------------------------------------------------------------------------
+
+class DaedalusUniversal(Daedalus):
+    """
+    Universal adversarial perturbation against YOLO26's one2one head.
+
+    Trains a single full-image delta over a dataset so that adding it to ANY
+    image floods the output with high-confidence spurious boxes.
+
+    Perturbation is additive and constrained to an L-inf epsilon ball
+    (standard UAP formulation), applied as clamp(img + delta, 0, 1).
+    Inherits the model setup and loss helpers from Daedalus.
+    """
+
+    def train(
+        self,
+        image_dir,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        epsilon=EPSILON,
+        save_path=UNIVERSAL_SAVE_PATH,
+        checkpoint_every=1,
+    ):
+        os.makedirs(save_path, exist_ok=True)
+
+        dataset = SceneDataset(image_dir)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=True,
+            num_workers=2, pin_memory=(self.device == "cuda"), drop_last=True,
+        )
+
+        # The universal perturbation — one delta shared across every image.
+        delta = torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE,
+                            device=self.device, requires_grad=True)
+        optimizer = mSAM([delta], torch.optim.AdamW, rho=self.rho, lr=self.lr)
+        total_steps = epochs * len(loader)
+        warmup_steps = max(1, int(total_steps * 0.1))
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer.base_optimizer,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(
+                    optimizer.base_optimizer,
+                    start_factor=0.1, end_factor=1.0, total_iters=warmup_steps,
+                ),
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer.base_optimizer,
+                    T_max=total_steps - warmup_steps, eta_min=self.lr * 0.01,
+                ),
+            ],
+            milestones=[warmup_steps],
+        )
+
+        print(
+            f"\n=== Training universal perturbation (eps={epsilon:.4f}) ===\n"
+            f"    dataset : {len(dataset)} images  |  batch : {batch_size}"
+            f"  |  epochs : {epochs}\n"
+        )
+
+        for epoch in range(1, epochs + 1):
+            ep_adv = ep_top = 0.0
+            n_steps = 0
+            pbar = tqdm(loader, desc=f"epoch {epoch:3d}/{epochs}", leave=True, ascii=True)
+            for imgs in pbar:
+                imgs = imgs.to(self.device)
+
+                # mSAM ascent
+                optimizer.zero_grad()
+                loss = self.adv_weight * self._adv_loss(
+                    self._scores((imgs + delta).clamp(0.0, 1.0)))
+                loss.backward()
+                optimizer.ascent_step()
+
+                # mSAM descent
+                optimizer.zero_grad()
+                scores = self._scores((imgs + delta).clamp(0.0, 1.0))
+                adv = self._adv_loss(scores)
+                loss = self.adv_weight * adv
+                loss.backward()
+                grad_norm = delta.grad.norm().item() if delta.grad is not None else 0.0
+                top = self._top_score(scores.detach())
+                optimizer.descent_step()
+                scheduler.step()
+
+                # Project delta back into the L-inf epsilon ball
+                with torch.no_grad():
+                    delta.clamp_(-epsilon, epsilon)
+
+                ep_adv += adv.item(); ep_top += top
+                n_steps += 1
+                pbar.set_postfix(
+                    adv=f"{adv.item():.4f}",
+                    top300=f"{top:.4f}",
+                    grad=f"{grad_norm:.2e}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                )
+
+            print(f"  -> epoch {epoch:3d} | adv={ep_adv / n_steps:.4f} "
+                  f"top300={ep_top / n_steps:.4f}")
+            if epoch % checkpoint_every == 0:
+                self._save_delta(delta, save_path, tag=f"epoch{epoch:03d}")
+
+        return self._save_delta(delta, save_path, tag="final")
+
+    def _save_delta(self, delta, save_path, tag=""):
+        """Save the raw perturbation (.npy) and a viewable normalised PNG."""
+        d = delta.detach().squeeze(0).permute(1, 2, 0).cpu().numpy()  # (H, W, 3)
+        suffix = f"_{tag}" if tag else ""
+        np.save(os.path.join(save_path, f"delta{suffix}.npy"), d)
+        # Normalise to [0, 1] for visualisation (delta is small and signed)
+        vis = (d - d.min()) / (d.max() - d.min() + 1e-12)
+        io.imsave(os.path.join(save_path, f"delta{suffix}.png"),
+                  (vis * 255).clip(0, 255).astype(np.uint8))
+        return d
+
+
+# ---------------------------------------------------------------------------
 # Preprocessing
 # ---------------------------------------------------------------------------
 
@@ -356,22 +477,36 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["single", "universal"], default="single")
     parser.add_argument("--image-dir", default="../Datasets/COCO/val2017/")
+    # single mode
     parser.add_argument("--num-images", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=ITERATIONS)
+    # universal mode
+    parser.add_argument("--epochs",     type=int,   default=EPOCHS)
+    parser.add_argument("--batch-size", type=int,   default=BATCH_SIZE)
+    parser.add_argument("--epsilon",    type=float, default=EPSILON)
     args = parser.parse_args()
 
-    imgs = []
-    for root, _, files in os.walk(args.image_dir):
-        for f in sorted(files):
-            if not f.lower().endswith((".jpg", ".jpeg", ".png")):
-                continue
-            imgs.append(preprocess(os.path.join(root, f)))
+    if args.mode == "universal":
+        DaedalusUniversal().train(
+            args.image_dir,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            epsilon=args.epsilon,
+        )
+    else:
+        imgs = []
+        for root, _, files in os.walk(args.image_dir):
+            for f in sorted(files):
+                if not f.lower().endswith((".jpg", ".jpeg", ".png")):
+                    continue
+                imgs.append(preprocess(os.path.join(root, f)))
+                if len(imgs) >= args.num_images:
+                    break
             if len(imgs) >= args.num_images:
                 break
-        if len(imgs) >= args.num_images:
-            break
-    if not imgs:
-        raise FileNotFoundError(f"No images found in {args.image_dir}")
+        if not imgs:
+            raise FileNotFoundError(f"No images found in {args.image_dir}")
 
-    Daedalus(iterations=args.iterations).attack(imgs)
+        Daedalus(iterations=args.iterations).attack(imgs)
