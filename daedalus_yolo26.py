@@ -20,6 +20,7 @@ import os
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from skimage import io
@@ -131,7 +132,8 @@ SAVE_PATH        = "adv_examples/yolo26/"
 EPOCHS           = 10
 BATCH_SIZE       = 8
 EPSILON          = 16 / 255   # L-inf budget on the universal perturbation
-UNIVERSAL_SAVE_PATH = "adv_examples/yolo26_universal/"
+UNIVERSAL_SAVE_PATH  = "adv_examples/yolo26_universal/"
+GENERATOR_SAVE_PATH  = "adv_examples/yolo26_generator/"
 
 
 class Daedalus:
@@ -458,6 +460,210 @@ class DaedalusUniversal(Daedalus):
 
 
 # ---------------------------------------------------------------------------
+# Conditional perturbation generator
+# ---------------------------------------------------------------------------
+
+class PerturbationGenerator(nn.Module):
+    """
+    Lightweight U-Net encoder-decoder: x -> delta, ||delta||_inf <= epsilon.
+
+    Three stride-2 encoder stages (3→32→64→128) and three transposed-conv
+    decoder stages with skip connections from the corresponding encoder level.
+    Output is tanh(logits) * epsilon — hard L∞ bound, no projection needed.
+
+    ~350 K parameters; one forward pass replaces 1000 optimisation iterations.
+    """
+
+    def __init__(self, epsilon=EPSILON):
+        super().__init__()
+        self.epsilon = epsilon
+
+        # Encoder — LeakyReLU throughout; no BN (single-image stable)
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1), nn.LeakyReLU(0.1, inplace=True))
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.LeakyReLU(0.1, inplace=True))
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.LeakyReLU(0.1, inplace=True))
+
+        # Decoder — upsample via 4×4 transposed conv, then fuse with skip
+        self.dec3 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1), nn.LeakyReLU(0.1, inplace=True))
+        self.fuse3 = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1), nn.LeakyReLU(0.1, inplace=True))
+
+        self.dec2 = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), nn.LeakyReLU(0.1, inplace=True))
+        self.fuse2 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1), nn.LeakyReLU(0.1, inplace=True))
+
+        self.dec1 = nn.ConvTranspose2d(32, 3, 4, stride=2, padding=1)
+
+        # Small init so perturbations start near zero
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, a=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        e1 = self.enc1(x)                                 # (N, 32, 320, 320)
+        e2 = self.enc2(e1)                                # (N, 64, 160, 160)
+        e3 = self.enc3(e2)                                # (N, 128, 80, 80)
+
+        d3 = self.fuse3(torch.cat([self.dec3(e3), e2], 1))  # (N, 64, 160, 160)
+        d2 = self.fuse2(torch.cat([self.dec2(d3), e1], 1))  # (N, 32, 320, 320)
+        d1 = self.dec1(d2)                                   # (N, 3, 640, 640)
+
+        return torch.tanh(d1) * self.epsilon
+
+
+class DaedalusGenerator(Daedalus):
+    """
+    Conditional adversarial perturbation generator for YOLO26.
+
+    Trains a small encoder-decoder G so that for any image x:
+        x_adv = clip(x + G(x), 0, 1)
+    floods the one2one head with high-confidence spurious detections.
+
+    Advantages over DaedalusUniversal:
+      - Perturbation is image-conditioned, exploiting per-image structure.
+      - Test-time cost = one forward pass through G (vs. 1000 optim iters).
+    The L∞ bound is enforced by tanh(·)*epsilon inside G — no projection step.
+    """
+
+    def __init__(self, epsilon=EPSILON, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+        self.generator = PerturbationGenerator(epsilon).to(self.device)
+
+    def _apply(self, imgs):
+        """Return adversarial images for a batch."""
+        delta = self.generator(imgs)
+        return (imgs + delta).clamp(0.0, 1.0)
+
+    def train(
+        self,
+        image_dir,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        save_path=GENERATOR_SAVE_PATH,
+        checkpoint_every=1,
+    ):
+        os.makedirs(save_path, exist_ok=True)
+
+        dataset = SceneDataset(image_dir)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=True,
+            num_workers=2, pin_memory=(self.device == "cuda"), drop_last=True,
+        )
+
+        n_params = sum(p.numel() for p in self.generator.parameters())
+        print(
+            f"\n=== Training perturbation generator (eps={self.epsilon:.4f}) ===\n"
+            f"    params  : {n_params:,}  |  dataset : {len(dataset)} images"
+            f"  |  batch : {batch_size}  |  epochs : {epochs}\n"
+        )
+
+        optimizer = mSAM(
+            self.generator.parameters(), torch.optim.AdamW,
+            rho=self.rho, lr=self.lr,
+        )
+        total_steps  = epochs * len(loader)
+        warmup_steps = max(1, int(total_steps * 0.1))
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer.base_optimizer,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(
+                    optimizer.base_optimizer,
+                    start_factor=0.1, end_factor=1.0, total_iters=warmup_steps,
+                ),
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer.base_optimizer,
+                    T_max=total_steps - warmup_steps, eta_min=self.lr * 0.01,
+                ),
+            ],
+            milestones=[warmup_steps],
+        )
+
+        for epoch in range(1, epochs + 1):
+            ep_adv = ep_top = 0.0
+            n_steps = 0
+            pbar = tqdm(loader, desc=f"epoch {epoch:3d}/{epochs}", leave=True, ascii=True)
+            for imgs in pbar:
+                imgs = imgs.to(self.device)
+
+                # mSAM ascent — first forward pass
+                optimizer.zero_grad()
+                loss = self.adv_weight * self._adv_loss(self._scores(self._apply(imgs)))
+                loss.backward()
+                optimizer.ascent_step()
+
+                # mSAM descent — second forward pass at perturbed generator params
+                optimizer.zero_grad()
+                scores = self._scores(self._apply(imgs))
+                adv    = self._adv_loss(scores)
+                (self.adv_weight * adv).backward()
+
+                grad_norm = sum(
+                    p.grad.norm().item() ** 2
+                    for p in self.generator.parameters() if p.grad is not None
+                ) ** 0.5
+                top = self._top_score(scores.detach())
+                optimizer.descent_step()
+                scheduler.step()
+
+                ep_adv += adv.item(); ep_top += top
+                n_steps += 1
+                pbar.set_postfix(
+                    adv=f"{adv.item():.4f}",
+                    top300=f"{top:.4f}",
+                    grad=f"{grad_norm:.2e}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                )
+
+            print(f"  -> epoch {epoch:3d} | adv={ep_adv / n_steps:.4f} "
+                  f"top300={ep_top / n_steps:.4f}")
+            if epoch % checkpoint_every == 0:
+                self._save_generator(save_path, tag=f"epoch{epoch:03d}", imgs=imgs)
+
+        return self._save_generator(save_path, tag="final", imgs=imgs)
+
+    def _save_generator(self, save_path, tag="", imgs=None):
+        suffix = f"_{tag}" if tag else ""
+        ckpt_path = os.path.join(save_path, f"generator{suffix}.pt")
+        torch.save(self.generator.state_dict(), ckpt_path)
+
+        # Visualise: save the perturbation and adversarial image for the first
+        # example in the last batch so progress is visually inspectable.
+        if imgs is not None:
+            with torch.no_grad():
+                delta = self.generator(imgs[:1])
+                adv   = (imgs[:1] + delta).clamp(0.0, 1.0)
+            d_np = delta.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            a_np = adv.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            vis = (d_np - d_np.min()) / (d_np.max() - d_np.min() + 1e-12)
+            io.imsave(os.path.join(save_path, f"delta{suffix}.png"),
+                      (vis * 255).clip(0, 255).astype(np.uint8))
+            io.imsave(os.path.join(save_path, f"adv{suffix}.png"),
+                      (a_np * 255).clip(0, 255).astype(np.uint8))
+        return ckpt_path
+
+    @torch.no_grad()
+    def apply(self, img_np):
+        """
+        Apply trained generator to a single image.
+
+        img_np: (H, W, 3) float32 in [0, 1]
+        returns: (H, W, 3) float32 adversarial image
+        """
+        x = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
+        x = F.interpolate(x, size=(IMAGE_SIZE, IMAGE_SIZE), mode="bilinear", align_corners=False)
+        adv = self._apply(x)
+        return adv.squeeze(0).permute(1, 2, 0).cpu().numpy()
+
+
+# ---------------------------------------------------------------------------
 # Preprocessing
 # ---------------------------------------------------------------------------
 
@@ -477,7 +683,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["single", "universal"], default="single")
+    parser.add_argument("--mode", choices=["single", "universal", "generator"], default="single")
     parser.add_argument("--image-dir", default="../Datasets/COCO/val2017/")
     # single mode
     parser.add_argument("--num-images", type=int, default=1)
@@ -494,6 +700,12 @@ if __name__ == "__main__":
             epochs=args.epochs,
             batch_size=args.batch_size,
             epsilon=args.epsilon,
+        )
+    elif args.mode == "generator":
+        DaedalusGenerator(epsilon=args.epsilon).train(
+            args.image_dir,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
         )
     else:
         imgs = []
