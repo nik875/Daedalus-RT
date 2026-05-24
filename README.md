@@ -14,9 +14,7 @@ Daedalus-RT is a real-time, on-device, YOLO26-MLX version of the adversarial att
 
 ![](delta_final.png)
 
-There is one more giant problem: **YOLO26 doesn't use non-maximal suppression.** This is the first version to make the switch, and it's noted as a [major efficiency improvement](https://docs.ultralytics.com/models/yolo26) in their docs. So is the Daedalus attack a dead-end?
-
-They replaced it with a simple top-k confidence threshold (supporting up to 300 detections). Turns out that **this is even more vulnerable than NMS!** We don't need to worry about making bounding boxes non-overlapping; we just have to crank up the confidence of enough false positives to flood the 300 limit.
+There is one more giant problem: **YOLO26 doesn't use non-maximal suppression.** This is the first version to make the switch, and it's noted as a [major efficiency improvement](https://docs.ultralytics.com/models/yolo26) in their docs. Ultralytics replaced it with a simple top-k confidence threshold (supporting up to 300 detections). Turns out that **this is even more vulnerable than NMS!** We don't need to worry about making bounding boxes non-overlapping; we just have to crank up the confidence of enough false positives to flood the 300 limit.
 
 ### Real-Time Demo
 
@@ -24,8 +22,35 @@ They replaced it with a simple top-k confidence threshold (supporting up to 300 
 
 There is essentially 0 impact to latency, yet it completely destroys YOLO26 MLX's ability to detect objects. Injecting the attack into your friend's codebase can be as simple as these 3 lines, meaning you really could do this while they're in the bathroom:
 
-```
+```python
 clean = current_video_frame.astype(np.float32) / 255.0
 delta = np.load("delta_final.npy")
 adv = (np.clip(clean + delta, 0.0, 1.0) * 255).astype(np.uint8)
 ```
+
+I've included a demo script `visualize_attack.py` to demonstrate the attack on a single image (dependencies: opencv-python, numpy, ultralytics, yolo26mlx):
+
+```python
+python visualize_attack.py IMAGE --delta delta_final.npy --model yolo26n.npz
+```
+
+To see a live video demo (same dependencies):
+
+```python
+python camera_demo.py --model yolo26n.npz
+```
+
+To train the attack yourself on YOLO26-n (val2017 is the path to the COCO 2017 validation set; additional dependencies are torch, tqdm, scikit-image):
+
+```python
+python daedalus_yolo26.py --mode universal --image-dir val2017/ --epochs 10 --batch-size 8
+```
+
+## Technical Details
+
+| Stage | Hardware | Model |
+|-------|----------|-------|
+| Training | NVIDIA A6000 GPU | YOLO26-n |
+| Eval | Apple M1 Pro | YOLO26-n (MLX) |
+
+Though Daedalus-RT was only trained on YOLO26-n for its accelerated training speed, prior literature already demonstrated that Daedalus is effective against a broad range of CNN-based object detectors, so I expect Daedalus-RT to have no issues with the larger models as well.
