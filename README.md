@@ -1,50 +1,31 @@
-# Daedalus-attack
-The code of our paper "Daedalus: Breaking Non-Maximum Suppression in Object Detection via Adversarial Examples".
+# Daedalus-RT
 
-We propose an attack, in which we can tune the strength of the attack and specify the object category to attack, to break non-maximum suppression (NMS) in object detection. As the consequence, the detection model outputs extremely dense results as redundant detection boxes are not filtered by NMS.
+Wouldn't it be funny to mess with literally every other submission to the YOLO26 MLX Build Challenge? Introducing Daedalus-RT:
 
-Some results are displayed here:
-![Alt text](resources/l2attack.jpg)
-*Adversarial examples made by our L2 attack. The first row contains original images. The third row contains our low-confidence (0.3) adversarial examples. The fifth row contains our high-confidence (0.7) examples. The detection results from YOLO-v3 are in the rows below them. The confidence controls the density of the redundant detection boxes in the detection results.*
+![](comparison_mlx.png)
 
-**Launching real-world attacks via a Daedalus poster**
+## Attack Overview
 
-We instantiated the Daedalus perturbation into a physical poster. You can watch the demo of the attack on YouTube:
-[![Watch the video](https://img.youtube.com/vi/U1LsTl8vufM/maxresdefault.jpg)](https://www.youtube.com/watch?v=U1LsTl8vufM)
-The code for generating posters against YOLO-v3 is in [this](https://github.com/NeuralSec/Daedalus-physical) repository (for academic purpose only).
+Imagine your "friend" (rival?) is also participating in the YOLO26 MLX Build Challenge, and has made the mistake of targeting the same submission track as you. After gloating about their obviously inferior project, they make the second mistake of leaving their laptop open and unlocked to use the restroom. Within those ~10 minutes, you can insert Daedalus-RT to undetectably sabotage their code.
 
----
+Daedalus-RT is a real-time, on-device, YOLO26-MLX version of the adversarial attack first proposed in [this 2020 paper](https://arxiv.org/abs/1902.02067). Object detectors use non-maximal suppression to filter out duplicate overlapping detections, so if we slightly perturb an image to minimize the size and maximize the confidence of all predicted bounding boxes, we can flood NMS with non-overlapping false positives.
 
-**Running the attack against YOLO-v3:**
+... at least in theory. The original Daedalus attack requires re-optimization for every image, taking 10+ minutes per frame. If your friend is using YOLO26 MLX, clearly latency is a high priority and it would raise far too many red flags to completely crater it. [This 2016 paper](https://arxiv.org/abs/1610.08401) demonstrated that you can learn a single filter that breaks detection on *any* image (a "universal" adversarial perturbation, UAP), and [this 2023 paper](https://openaccess.thecvf.com/content/WACV2023/papers/Shapira_Phantom_Sponges_Exploiting_Non-Maximum_Suppression_To_Attack_Deep_Object_Detectors_WACV_2023_paper.pdf) already extended it to a Daedalus-style NMS attack. So Daedalus-RT takes the same approach, bringing the attack's latency from minutes to microseconds. Just compositing this (highly amplified) UAP over each frame is sufficient to break YOLO26-n:
 
-1. Download [yolo.h5](https://1drv.ms/u/s!AqftEu9YAdEGidZ7vEm-4v4c2sV-Lw) and put it into '../model';
-2. Put original images into '../Datasets/COCO/val2017/';
-3. Run l2_yolov3.py.
+![](delta_final.png)
 
-**Running the attack against RetinaNet:**
+There is one more giant problem: **YOLO26 doesn't use non-maximal suppression.** This is the first version to make the switch, and it's noted as a [major efficiency improvement](https://docs.ultralytics.com/models/yolo26) in their docs. So is the Daedalus attack a dead-end?
 
-1. Install [keras-retinanet](https://github.com/fizyr/keras-retinanet);
-2. Download [resnet50_coco_best_v2.1.0.h5](https://drive.google.com/file/d/1N6Xg5SOW8Ic4hpC8PoIRvggcstx0HcXw/view?usp=sharing) and put it into '../model';
-3. Put original images into '../Datasets/COCO/val2017/';
-4. Run l2_retinanet.py.
+They replaced it with a simple top-k confidence threshold (supporting up to 300 detections). Turns out that **this is even more vulnerable than NMS!** We don't need to worry about making bounding boxes non-overlapping; we just have to crank up the confidence of enough false positives to flood the 300 limit.
 
-**Running ensemble attack to craft robust adversarial examples:**
+### Real-Time Demo
 
-Run l2_ensemble.py after completing the above setups for YOLO-v3 and RetinaNet attacks.
+![](compressed_demo.gif)
 
-All attacks can specify object categories to attack. Crafted adversarial examples will be stored as 416X416 sized .png files in '../adv_examples/...'. The examples can be tested on official darknet and retinanet.
-
-Cite this work:
+There is essentially 0 impact to latency, yet it completely destroys YOLO26 MLX's ability to detect objects. Injecting the attack into your friend's codebase can be as simple as these 3 lines, meaning you really could do this while they're in the bathroom:
 
 ```
-@article{wang2021daedalus,
-  title={Daedalus: Breaking nonmaximum suppression in object detection via adversarial examples},
-  author={Wang, Derui and Li, Chaoran and Wen, Sheng and Han, Qing-Long and Nepal, Surya and Zhang, Xiangyu and Xiang, Yang},
-  journal={IEEE Transactions on Cybernetics},
-  volume={52},
-  number={8},
-  pages={7427--7440},
-  year={2021},
-  publisher={IEEE}
-}
+clean = current_video_frame.astype(np.float32) / 255.0
+delta = np.load("delta_final.npy")
+adv = (np.clip(clean + delta, 0.0, 1.0) * 255).astype(np.uint8)
 ```
